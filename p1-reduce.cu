@@ -231,6 +231,85 @@ int cuda_max(int * arr, int arrSize){
 
 }
 
+struct valIdx{
+    int val;
+    int idx;
+};
+
+__global__ void argmax_helper(int * arr, int n, struct valIdx * maxes){
+    __shared__ valIdx pairs[32];
+
+    int local_max = INT_MIN;
+    int local_max_idx = -1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for(int i = idx; i < n; i += stride){
+        if (arr[i] > local_max){
+            local_max = arr[i];
+            local_max_idx = i;
+        }
+    }
+
+    int lane = threadIdx.x %32;
+    int warp_id = threadIdx.x / 32;
+
+    for(int offset = 16; offset > 0; offset >>= 1){
+        int other_val = __shfl_down_sync(0xffffffff, local_max, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
+
+        if(other_val > local_max){
+            local_max = other_val;
+            local_max_idx = other_idx;
+        }else if(other_val == local_max){
+            local_max_idx = min(local_max_idx, other_idx);
+        }
+
+    }
+
+    if(lane == 0){
+        pairs[warp_id].val = local_max;
+        pairs[warp_id].idx = local_max_idx;
+    }
+
+    __syncthreads();
+
+    int block_max = INT_MIN;
+    int block_max_idx = -1;
+    int warps_per_block = (blockDim.x + warpSize -1) / warpSize;
+
+    if(warp_id == 0){
+        if(lane < warps_per_block){
+            block_max = pairs[lane].val;
+            block_max_idx = pairs[lane].idx;
+        }else{
+            block_max = INT_MIN;
+            block_max_idx = -1;
+        }
+
+        for(int offset = 16; offset >0; offset >>= 1){
+            int other_block_max = __shfl_down_sync(0xffffffff, block_max, offset);
+            int other_block_max_idx = __shfl_down_sync(0xffffffff, block_max_idx, offset);
+
+            if (other_block_max > block_max){
+                block_max = other_block_max;
+                block_max_idx = other_block_max_idx;
+            }else if(other_block_max == block_max){
+                block_max_idx = min(block_max_idx, other_block_max_idx);
+            }
+        }
+
+        if(lane == 0){
+            maxes[blockIdx.x].val = block_max;
+            maxes[blockIdx.x].idx = block_max_idx;
+        }
+    }
+    
+
+}
+
+
+
 
 int main(){
 
