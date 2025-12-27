@@ -304,11 +304,77 @@ __global__ void argmax_helper(int * arr, int n, struct valIdx * maxes){
             maxes[blockIdx.x].idx = block_max_idx;
         }
     }
-    
 
 }
 
+__global__ void argmax_helper2(struct valIdx * maxes, int n){
+    __shared__ valIdx warp_maxes[32];
 
+    int tid = threadIdx.x;
+    int local_max = INT_MIN;
+    int local_max_idx = -1;
+
+    if(tid < n){
+        local_max = maxes[tid].val;
+        local_max_idx = maxes[tid].idx;
+    }
+
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+
+    for(int offset = 16; offset > 0; offset >>= 1){
+        int other_val = __shfl_down_sync(0xffffffff, local_max, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
+
+        if(other_val > local_max){
+            local_max = other_val;
+            local_max_idx = other_idx;
+        }else if(other_val == local_max){
+            local_max_idx = min(local_max_idx, other_idx);
+        }
+
+    }
+
+    if (lane == 0){
+        warp_maxes[warp_id].val = local_max;
+        warp_maxes[warp_id].idx = local_max_idx;
+    }
+
+    __syncthreads();
+
+    int overallMax = INT_MIN;
+    int overallMaxIdx = -1;
+    int warps_per_block = (blockDim.x + warpSize -1) / warpSize;
+
+    if(warp_id == 0){
+        if(lane < warps_per_block){
+            overallMax = warp_maxes[lane].val;
+            overallMaxIdx = warp_maxes[lane].idx;
+        }else{
+            overallMax = INT_MIN;
+            overallMaxIdx = -1;
+        }
+        for(int offset = 16; offset > 0; offset >>= 1){
+            int other_val = __shfl_down_sync(0xffffffff, overallMax, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, overallMaxIdx, offset);
+
+            if(other_val > overallMax){
+                overallMax = other_val;
+                overallMaxIdx = other_idx;
+            }else if(other_val == overallMax){
+                overallMaxIdx = min(overallMaxIdx, other_idx);
+            }
+
+        }
+        if (lane == 0){
+            maxes[0].val = overallMax;
+            maxes[0].idx = overallMaxIdx;
+        }
+
+
+    }
+
+}
 
 
 int main(){
