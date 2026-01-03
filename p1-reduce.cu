@@ -201,7 +201,6 @@ __global__ void max_helper2(int * block_maxes, int n){
 }
 
 int cuda_max(int * arr, int arrSize){
-    int min = INT_MIN;
     int numThreads = 256;
     int size = arrSize * sizeof(int);
     int blocks = (arrSize + numThreads -1) / numThreads;
@@ -221,13 +220,16 @@ int cuda_max(int * arr, int arrSize){
 
     max_helper2<<<1, numThreads>>>(d_blockMaxes, blocks);
 
+    cudaDeviceSynchronize();
+
     cudaMemcpy(h_blockMaxes, d_blockMaxes, blockSize, cudaMemcpyDeviceToHost);
 
     cudaFree(d_arr);
     cudaFree(d_blockMaxes);
+    int res = h_blockMaxes[0];
     free(h_blockMaxes);
 
-    return h_blockMaxes[0];
+    return res;
 
 }
 
@@ -376,7 +378,125 @@ __global__ void argmax_helper2(struct valIdx * maxes, int n){
 
 }
 
+__global__ void argmax_reduce(const valIdx* in, int n, valIdx* out) {
+    __shared__ valIdx warp_maxes[32];
 
+    int tid   = threadIdx.x;
+    int lane  = tid & 31;            // tid % 32
+    int warp  = tid / 5;            // tid / 32
+
+    // Grid-stride over the input valIdx array
+    int start  = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
+    int local_max     = INT_MIN;
+    int local_max_idx = -1;
+
+    for (int i = start; i < n; i += stride) {
+        int v = in[i].val;
+        int idx = in[i].idx;
+
+        if (v > local_max) {
+            local_max = v;
+            local_max_idx = idx;
+        } else if (v == local_max) {
+            local_max_idx = min(local_max_idx, idx);
+        }
+    }
+
+    // Warp reduce (val, idx) with tie-break on smallest idx
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        int other_val = __shfl_down_sync(0xffffffff, local_max, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
+
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_max_idx = other_idx;
+        } else if (other_val == local_max) {
+            local_max_idx = min(local_max_idx, other_idx);
+        }
+    }
+
+    if (lane == 0) {
+        warp_maxes[warp].val = local_max;
+        warp_maxes[warp].idx = local_max_idx;
+    }
+
+    __syncthreads();
+
+    int warps_per_block = (blockDim.x + 31) / 32;
+
+    int block_max = INT_MIN;
+    int block_max_idx = -1;
+
+    if (warp == 0) {
+        if (lane < warps_per_block) {
+            block_max     = warp_maxes[lane].val;
+            block_max_idx = warp_maxes[lane].idx;
+        }
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            int other_val = __shfl_down_sync(0xffffffff, block_max, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, block_max_idx, offset);
+
+            if (other_val > block_max) {
+                block_max = other_val;
+                block_max_idx = other_idx;
+            } else if (other_val == block_max) {
+                block_max_idx = min(block_max_idx, other_idx);
+            }
+        }
+
+        if (lane == 0) {
+            out[blockIdx.x].val = block_max;
+            out[blockIdx.x].idx = block_max_idx;
+        }
+    }
+}
+
+int cuda_argmax(int * arr, int arrSize){
+    int numThreads = 256;
+    int size = arrSize * sizeof(int);
+    int blocks = (arrSize + numThreads -1) / numThreads;
+    int blockSize = blocks * sizeof(valIdx);
+
+    valIdx h_out;
+    int *d_arr;
+    valIdx *d_blockMaxes;
+
+    cudaMalloc(&d_arr, size);
+    cudaMalloc(&d_blockMaxes, blockSize);
+
+    cudaMemcpy(d_arr, arr, size, cudaMemcpyHostToDevice);
+    
+    // reduces each warp and writes one max val and idx per block
+    argmax_helper<<<blocks, numThreads>>>(d_arr, arrSize, d_blockMaxes);
+
+    cudaDeviceSynchronize();
+
+    // iteratively reduce each block into global max value and its corresponding idx
+    // making it therefore more scalable
+    int currSize = blocks;
+    valIdx *d_in = d_blockMaxes;
+    valIdx *d_out;
+    while(currSize > 1){
+        int nextBlockSize = (currSize + numThreads-1)/numThreads;
+        cudaMalloc(&d_out, nextBlockSize *sizeof(valIdx));
+
+        argmax_reduce<<<nextBlockSize, numThreads>>>(d_in, currSize, d_out);
+        cudaDeviceSynchronize();
+        cudaFree(d_in);
+        d_in = d_out;
+        currSize = nextBlockSize;
+    }
+
+    cudaMemcpy(&h_out, d_in, sizeof(valIdx), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_arr);
+    cudaFree(d_in);
+    return h_out.idx;
+
+}
 int main(){
 
 }
