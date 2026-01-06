@@ -1,6 +1,8 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <algorithm>  
+#include <span>
+#include <vector>
 using namespace std;
 
 #define BLOCK_SIZE 256
@@ -385,7 +387,7 @@ __global__ void argmax_reduce(const valIdx* in, int n, valIdx* out) {
     int lane  = tid & 31;            // tid % 32
     int warp  = tid / 5;            // tid / 32
 
-    // Grid-stride over the input valIdx array
+    // Gridstride over the input valIdx array
     int start  = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
 
@@ -404,7 +406,7 @@ __global__ void argmax_reduce(const valIdx* in, int n, valIdx* out) {
         }
     }
 
-    // Warp reduce (val, idx) with tie-break on smallest idx
+    // Warp reduce (val, idx) with tie break on smallest idx
     for (int offset = 16; offset > 0; offset >>= 1) {
         int other_val = __shfl_down_sync(0xffffffff, local_max, offset);
         int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
@@ -497,6 +499,135 @@ int cuda_argmax(int * arr, int arrSize){
     return h_out.idx;
 
 }
-int main(){
 
+template <typename T>
+struct TvalIdx{
+    T val;
+    int idx;
+};
+
+template<typename T, typename Operation> 
+__global__ void reduce(const T *in, int n, TvalIdx<T> *out, Operation op){
+    TvalIdx<T> local;
+    int tid = threadIdx.x;
+    int start  = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
+    local.val = -INFINITY;
+    local.idx = -1;
+
+    for(int i = start; i < n; i += stride){
+        TvalIdx<T> c = {in[i], i};
+        local = op(local, c);
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        TvalIdx<T> other;
+        other.val = __shfl_down_sync(0xffffffff, local.val, offset);
+        other.idx = __shfl_down_sync(0xffffffff, local.idx, offset);
+        local = op(local, other);
+    }
+
+    __shared__ TvalIdx<T> warp_vals[32];
+    int lane = tid % warpSize;
+    int warp_id = tid / warpSize;
+
+    if (lane == 0){
+        warp_vals[warp_id] = local;
+    }
+
+    __syncthreads();
+
+    if(warp_id == 0){
+        local = (lane < blockDim.x/warpSize) // warps per block
+            ? warp_vals[lane] : TvalIdx<T>{-INFINITY,-1};
+
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            TvalIdx<T> other;
+            other.val = __shfl_down_sync(0xffffffff, local.val, offset);
+            other.idx = __shfl_down_sync(0xffffffff, local.idx, offset);
+            local = op(local,other);
+        }
+        if(lane == 0){
+            out[blockIdx.x] = local;
+        }
+    }
+}
+
+template <typename T>
+struct argMax {
+    __device__ __forceinline__
+    TvalIdx<T> operator()(TvalIdx<T> a, TvalIdx<T> b) const {
+        if (a.val > b.val) return a;
+        if (b.val > a.val) return b;
+        return(a.idx < b.idx) ? a : b; 
+    }
+};
+
+template <typename T>
+struct argMin {
+    __device__ __forceinline__
+    TvalIdx<T> operator()(TvalIdx<T> a, TvalIdx<T> b) const {
+        if (a.val < b.val) return a;
+        if (b.val < a.val) return b;
+        return(a.idx < b.idx) ? a : b;
+    }
+};
+
+template<typename T>
+int template_argMax(span<T> arr){
+    int n = arr.size();
+    int numThreads = 256;
+    int blocks = (n + numThreads - 1) / numThreads;
+
+    T* d_input;
+    cudaMalloc(&d_input, n * sizeof(T));
+    cudaMemcpy(d_input, arr.data(), n * sizeof(T), cudaMemcpyHostToDevice);
+    
+    TvalIdx<T>* d_out;
+    cudaMalloc(&d_out, blocks * sizeof(TvalIdx<T>));
+    
+    reduce<<<blocks, numThreads>>>(
+        d_input,
+        n,
+        d_out,
+        argMax<T>()
+    );
+
+    TvalIdx<T>* curr_in = d_out;
+    int curr_n = blocks;
+    TvalIdx<T>* curr_out;
+
+
+    while(curr_n > 1){
+        blocks = (n + numThreads - 1) / numThreads;
+        cudaMalloc(&curr_out, blocks * sizeof(TvalIdx<T>));
+        reduce<<<blocks, numThreads>>>(
+            curr_in,
+            curr_n,
+            curr_out,
+            argMax<T>()
+        );
+        cudaDeviceSynchronize();
+        cudaFree(curr_in);
+        curr_in = curr_out;
+        curr_n = blocks;
+    }
+
+    TvalIdx<T> host_out;
+    cudaMemcpy(&host_out, curr_in, sizeof(TvalIdx<T>), cudaMemcpyDeviceToHost);
+    cudaFree(d_input);
+    cudaFree(d_out);
+    if(curr_in != d_out){
+        cudaFree(curr_in);
+    }
+
+    return host_out.idx;
+
+}
+
+
+
+int main(){
+    return 0;
 }
